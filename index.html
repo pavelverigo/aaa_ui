@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+
+<title>aaa_ui</title>
+
+<style>
+canvas {
+  display: block;
+  margin: auto;
+}
+</style>
+
+<canvas id="canvas" width="1200" height="900"></canvas>
+
+<script type="module">
+
+const adapter = await navigator.gpu.requestAdapter();
+const device = await adapter.requestDevice();
+
+const context = canvas.getContext("webgpu");
+
+const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+
+context.configure({
+  device,
+  format: presentationFormat,
+});
+
+const vertWGSL = `
+@vertex
+fn main(
+  @builtin(vertex_index) VertexIndex : u32
+) -> @builtin(position) vec4f {
+  var pos = array<vec2f, 3>(
+    vec2(-1.0, -1.0),
+    vec2(3.0, -1.0),
+    vec2(-1.0, 3.0)
+  );
+
+  return vec4f(pos[VertexIndex], 0.0, 1.0);
+}
+`;
+
+const fragWGSL = `
+@group(0) @binding(0) var<storage, read> data: array<u32>;
+
+// Circle SDF
+fn circleSDF(p: vec2f, center: vec2f, radius: f32) -> f32 {
+  return length(p - center) - radius;
+}
+
+// Segment SDF
+fn segmentSDF(p: vec2f, a: vec2f, b: vec2f, radius: f32) -> f32 {
+  let pa = p - a;
+  let ba = b - a;
+  let h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h) - radius;
+}
+
+@fragment
+fn main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
+  let xy = vec2f(fragCoord.x, fragCoord.y);
+  var result = vec3f(0.0, 0.0, 0.0); // Initialize result as RGB
+
+  // Iterate through all SDF objects
+  for (var i = 0u; i < arrayLength(&data);) {
+    let kind = data[i];
+    let color = unpack4x8unorm(data[i + 1]);
+    i += 2;
+
+    switch (kind) {
+      case 0u: { // Circle
+        let center = vec2f(bitcast<f32>(data[i]), bitcast<f32>(data[i + 1]));
+        let radius = bitcast<f32>(data[i + 2]);
+        i += 3;
+        let dist = circleSDF(xy, center, radius);
+        let aa_factor = clamp(0.5 - dist, 0.0, 1.0);
+        result = mix(result, color.rgb, aa_factor * color.a);
+      }
+      case 1u: { // Segment
+        let a = vec2f(bitcast<f32>(data[i]), bitcast<f32>(data[i + 1]));
+        let b = vec2f(bitcast<f32>(data[i + 2]), bitcast<f32>(data[i + 3]));
+        let radius = bitcast<f32>(data[i + 4]);
+        i += 5;
+        let dist = segmentSDF(xy, a, b, radius);
+        let aa_factor = clamp(0.5 - dist, 0.0, 1.0);
+        result = mix(result, color.rgb, aa_factor * color.a);
+      }
+      default: {
+        break;
+      }
+    }
+  }
+
+  return vec4f(result, 1.0);
+}
+`;
+
+// Create SDF buffer
+const sdfBuffer = device.createBuffer({
+  size: 1024,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+});
+
+// Bind group layout and pipeline updates for unified SDF buffer
+const bindGroupLayout = device.createBindGroupLayout({
+  entries: [
+    {
+      binding: 0,
+      visibility: GPUShaderStage.FRAGMENT,
+      buffer: { type: 'read-only-storage' },
+    },
+  ],
+});
+
+const bindGroup = device.createBindGroup({
+  layout: bindGroupLayout,
+  entries: [
+    { binding: 0, resource: { buffer: sdfBuffer } },
+  ],
+});
+
+const pipeline = device.createRenderPipeline({
+  layout: device.createPipelineLayout({
+    bindGroupLayouts: [bindGroupLayout],
+  }),
+  vertex: {
+    module: device.createShaderModule({
+      code: vertWGSL,
+    }),
+    entryPoint: 'main',
+  },
+  fragment: {
+    module: device.createShaderModule({
+      code: fragWGSL,
+    }),
+    entryPoint: 'main',
+    targets: [
+      {
+        format: presentationFormat,
+      },
+    ],
+  },
+  primitive: {
+    topology: 'triangle-list',
+  },
+});
+
+const WIDTH = 1200;
+const HEIGHT = 900;
+const RADIUS = 350;
+const NODE_RADIUS = 30;
+const SEGMENT_RADIUS = 2;
+const HEXAGON_NODE_COUNT = 6;
+
+let angle1 = 0;
+let angle2 = 0;
+
+function generateWheel(center, color, rotation) {
+  const nodes = [];
+  const segments = [];
+
+  for (let i = 0; i < HEXAGON_NODE_COUNT; i++) {
+    const theta = (2 * Math.PI * i) / HEXAGON_NODE_COUNT + rotation;
+    const x = center[0] + RADIUS * Math.cos(theta);
+    const y = center[1] + RADIUS * Math.sin(theta);
+
+    // Add the circle node
+    nodes.push({
+      kind: 0, // Circle
+      color,
+      x,
+      y,
+      r: NODE_RADIUS,
+    });
+
+    // Add the segment connecting this node to the next
+    const nextTheta = (2 * Math.PI * (i + 1)) / HEXAGON_NODE_COUNT + rotation;
+    const nextX = center[0] + RADIUS * Math.cos(nextTheta);
+    const nextY = center[1] + RADIUS * Math.sin(nextTheta);
+
+    segments.push({
+      kind: 1, // Segment
+      color: [255, 255, 255, 255], // White
+      x,
+      y,
+      nextX,
+      nextY,
+      r: SEGMENT_RADIUS,
+    });
+  }
+
+  return { nodes, segments };
+}
+
+function updateSDFBuffer(device, sdfs) {
+  // Pack RGBA color into a single uint32
+  function packColor([r, g, b, a]) {
+    return (r << 24) | (g << 16) | (b << 8) | a;
+  }
+
+  const sdfData = new ArrayBuffer(1024);
+  const sdfDataView = new DataView(sdfData);
+
+  let offset = 0;
+  sdfs.forEach((sdf, i) => {
+    switch (sdf.kind) {
+      case 0: 
+        sdfDataView.setUint32(offset, sdf.kind, true);
+        sdfDataView.setUint32(offset + 4, packColor(sdf.color), false);
+        sdfDataView.setFloat32(offset + 8, sdf.x, true);
+        sdfDataView.setFloat32(offset + 12, sdf.y, true);
+        sdfDataView.setFloat32(offset + 16, sdf.r, true);
+        offset += 20;
+        break;
+      case 1:
+        sdfDataView.setUint32(offset, sdf.kind, true);
+        sdfDataView.setUint32(offset + 4, packColor(sdf.color), false);
+        sdfDataView.setFloat32(offset + 8, sdf.x, true);
+        sdfDataView.setFloat32(offset + 12, sdf.y, true);
+        sdfDataView.setFloat32(offset + 16, sdf.nextX, true);
+        sdfDataView.setFloat32(offset + 20, sdf.nextY, true);
+        sdfDataView.setFloat32(offset + 24, sdf.r, true);
+        offset += 28;
+        break;
+    }
+  });
+
+  device.queue.writeBuffer(sdfBuffer, 0, sdfData, 0, offset);
+}
+
+let prev_t;
+function frame(t) {
+  if (prev_t === undefined) {
+    prev_t = t;
+  }
+  const dt = t - prev_t;
+  prev_t = t;
+  angle1 += dt * 0.0001;
+  angle2 -= dt * 0.0001;
+
+  const wheel1 = generateWheel([WIDTH / 3, HEIGHT / 2], [255, 0, 0, 127], angle1);
+  const wheel2 = generateWheel([(2 * WIDTH) / 3, HEIGHT / 2], [0, 0, 255, 127], angle2);
+
+  // Combine SDFs
+  const sdfs = [ ...wheel1.segments, ...wheel1.nodes, ...wheel2.segments, ...wheel2.nodes];
+
+  // Update the SDF buffer
+  updateSDFBuffer(device, sdfs);
+
+  // Render the frame
+  const commandEncoder = device.createCommandEncoder();
+  const textureView = context.getCurrentTexture().createView();
+
+  const renderPassDescriptor = {
+    colorAttachments: [
+      {
+        view: textureView,
+        clearValue: [0, 0, 0, 0], // Clear to transparent
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
+  };
+
+  const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+  passEncoder.setPipeline(pipeline);
+  passEncoder.setBindGroup(0, bindGroup);
+  passEncoder.draw(3);
+  passEncoder.end();
+
+  device.queue.submit([commandEncoder.finish()]);
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
+
+</script>
